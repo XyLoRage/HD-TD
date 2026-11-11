@@ -1,318 +1,423 @@
 -- Connected Discord-GitHub
 --[[
-ClientRenders: draws what the server only simulates. The server has a Folder per enemy
- and a target per tower; every model, animation and bullet here exists on this client
-alone, so a full wave costs the server nothing to replicate. It predicts movement from
-the same speed and path as EnemyAI instead of receiving positions.
+	ClientRenders
+
+	Draws what the server only simulates. The server keeps one Folder per enemy and one
+	Target value per tower; every model, animation and bullet here exists on this client
+	alone, so a full wave costs the server nothing to replicate. Enemy movement is predicted
+	from the same speed and path the server's EnemyAI uses, instead of receiving positions.
 ]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local TweenSvc = game:GetService("TweenService")
-local RepStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
 
 -- This script runs from ReplicatedFirst, which starts before the map has replicated.
 if not game:IsLoaded() then
 	game.Loaded:Wait()
 end
 
-local dataDir = RepStorage:WaitForChild("Data")
-local EnemyData = require(dataDir:WaitForChild("EnemyData"))
-local TowerData = require(dataDir:WaitForChild("TowerData"))
+local dataFolder = ReplicatedStorage:WaitForChild("Data")
+local EnemyData = require(dataFolder:WaitForChild("EnemyData"))
+local TowerData = require(dataFolder:WaitForChild("TowerData"))
 
-local enmDir = workspace:WaitForChild("Enemies")
-local twrDir = workspace:WaitForChild("Towers")
-local pathDir = workspace:WaitForChild("Path")
-local cliDir = workspace:WaitForChild("Client")
-local vfxDir = workspace:WaitForChild("VFX")
-local bltTmpl = RepStorage:WaitForChild("VFX"):WaitForChild("Projectiles"):WaitForChild("Yellow")
+-- How fast models swing round to a new direction. Higher is snappier.
+local TURN_SPEED = 8
+-- Furthest an enemy walks from the path's centre, so a wave doesn't move in single file.
+local PATH_SIDE_SPREAD = 0.7
+-- Walk cycles per stud of speed, which keeps the feet in time with the ground.
+local WALK_ANIMATION_RATE = 0.15
+-- Length of a bullet tracer in studs: how far its head leads its tail.
+local BULLET_TRAIL_LENGTH = 6
+-- Waypoint rays start this far above each part and travel this far down to find the road.
+local GROUND_RAY_HEIGHT = 5
+local GROUND_RAY_LENGTH = 20
+-- Directions shorter than this are treated as "no direction", since .Unit of one is NaN.
+local MIN_DIRECTION_LENGTH = 0.01
 
-local TURN_RATE = 8 -- how fast models swing round, higher = snappier
-local SIDE_SPRD = 0.7 -- max studs off the path's centre, stops enemies walking in one file
-local ANIM_RATE = 0.15 -- walk cycles per stud of speed, keeps feet in time with the ground
-local BLT_TAIL = 6 -- bullet length in studs, how far the head leads the tail
+local enemiesFolder = Workspace:WaitForChild("Enemies")
+local towersFolder = Workspace:WaitForChild("Towers")
+local pathFolder = Workspace:WaitForChild("Path")
+local clientFolder = Workspace:WaitForChild("Client")
+local effectsFolder = Workspace:WaitForChild("VFX")
+local bulletTemplate = ReplicatedStorage:WaitForChild("VFX")
+	:WaitForChild("Projectiles")
+	:WaitForChild("Yellow")
 
-type EnemyObj = {
-	part: Folder,
-	model: Model,
-	root: BasePart,
-	speed: number,
-	pos: Vector3,
-	vel: Vector3,
-	fwd: Vector3,
-	tgtWp: number,
-	side: number,
-	height: Vector3,
-}
-
-type TowerObj = {
-	root: BasePart,
-	stats: { [string]: any },
-	tgtVal: ObjectValue,
-	barrel: BasePart,
-	shoot: AnimationTrack,
-	cool: number,
-}
-
-local enemies: { [Instance]: EnemyObj } = {}
-local towers: { TowerObj } = {}
-local waypoints: { Vector3 } = {}
-local bltPool: { BasePart } = {}
--- Reused every frame by BulkMoveTo so moving a wave doesn't allocate two tables per frame.
-local bulkPart: { BasePart } = {}
-local bulkCf: { CFrame } = {}
-
----------------------------------------[[PATH]]---------------------------------------
--- Waypoints float at slightly different heights. Dropping each one onto the road means
--- the feet stay on the ground, without anyone having to place the parts perfectly.
-local function buildPath(): ()
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { pathDir, twrDir, cliDir, vfxDir }
-	for _, part in ipairs(pathDir:GetChildren()) do
-		local hit = workspace:Raycast(part.Position + Vector3.yAxis * 5, Vector3.yAxis * -20, params)
-		waypoints[tonumber(part.Name)] = hit and hit.Position or part.Position
-	end
-end
-
-local function flatUnit(vec: Vector3, default: Vector3): Vector3
-	local flat = Vector3.new(vec.X, 0, vec.Z)
-	return flat.Magnitude > 0.01 and flat.Unit or default
-end
-
--- Keeps turning at the same speed whatever the framerate; a fixed alpha wouldn't.
-local function turnAlpha(dt: number): number
-	return math.clamp(TURN_RATE * dt, 0, 1)
-end
-
----------------------------------------[[ENEMIES]]---------------------------------------
 local Enemy = {}
 Enemy.__index = Enemy
 
--- Forces looping because the walk has to keep going whatever the asset was exported as.
-local function playLoop(animator: Animator, anim: Animation, speed: number?): AnimationTrack
-	local track = animator:LoadAnimation(anim)
+local Tower = {}
+Tower.__index = Tower
+
+type EnemyFields = {
+	rootPart: BasePart,
+	_model: Model,
+	_speed: number,
+	_position: Vector3,
+	_velocity: Vector3,
+	_facing: Vector3,
+	_nextWaypoint: number,
+	_sideOffset: number,
+	_heightOffset: Vector3,
+}
+type EnemyObject = typeof(setmetatable({} :: EnemyFields, Enemy))
+
+type TowerStats = {
+	damage: number,
+	attackInterval: number,
+	range: number,
+	bulletSpeed: number,
+	mode: string,
+}
+
+type TowerFields = {
+	_rootPart: BasePart,
+	_stats: TowerStats,
+	_targetValue: ObjectValue,
+	_barrel: BasePart,
+	_shootTrack: AnimationTrack,
+	_cooldown: number,
+}
+type TowerObject = typeof(setmetatable({} :: TowerFields, Tower))
+
+-- Keyed by the server's enemy Folder, so a tower's Target value looks its enemy up directly.
+local enemiesByFolder: { [Instance]: EnemyObject } = {}
+local towers: { TowerObject } = {}
+local waypoints: { Vector3 } = {}
+local bulletPool: { BasePart } = {}
+-- Reused every frame by BulkMoveTo, so moving a wave doesn't allocate two tables per frame.
+local movedParts: { BasePart } = {}
+local movedCFrames: { CFrame } = {}
+
+--[[
+	Waypoints float at slightly different heights. Dropping each one onto the road keeps
+	the feet on the ground without anyone having to place the parts perfectly. The parts
+	are named 1, 2, 3..., so the name doubles as the walking order.
+]]
+local function buildWaypoints(): ()
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = {
+		pathFolder,
+		towersFolder,
+		clientFolder,
+		effectsFolder,
+	}
+
+	for _, waypointPart in ipairs(pathFolder:GetChildren()) do
+		local rayOrigin = waypointPart.Position + Vector3.yAxis * GROUND_RAY_HEIGHT
+		local rayDirection = Vector3.yAxis * -GROUND_RAY_LENGTH
+		local result = Workspace:Raycast(rayOrigin, rayDirection, raycastParams)
+		local index = tonumber(waypointPart.Name)
+		waypoints[index] = if result then result.Position else waypointPart.Position
+	end
+end
+
+--[[
+	Removes the height from a direction. Models turn using this, so they spin on the spot
+	and never tilt toward a waypoint that sits higher or lower than they do.
+]]
+local function getFlatDirection(direction: Vector3, fallback: Vector3): Vector3
+	local flatDirection = Vector3.new(direction.X, 0, direction.Z)
+	if flatDirection.Magnitude < MIN_DIRECTION_LENGTH then
+		return fallback
+	end
+	return flatDirection.Unit
+end
+
+-- Scaling by the frame time keeps turning speed equal at any framerate; a fixed alpha wouldn't.
+local function getTurnAlpha(deltaTime: number): number
+	return math.clamp(TURN_SPEED * deltaTime, 0, 1)
+end
+
+-- Forces looping, because walks and idles must keep going however the asset was exported.
+local function playLoopedAnimation(
+	animator: Animator,
+	animation: Animation,
+	speed: number?
+): AnimationTrack
+	local track = animator:LoadAnimation(animation)
 	track.Looped = true
 	track:Play(nil, nil, speed)
 	return track
 end
 
-function Enemy.new(part: Folder): EnemyObj
-	local def = EnemyData[part:GetAttribute("EnemyID")]
-	local speed = part:GetAttribute("Speed")
-	local model = def.model.Model:Clone()
-	local root = model.PrimaryPart
-	-- The root's centre sits half a root plus one leg above the feet. Read from the model
-	-- because the Tank is scaled up and would sink into the road with a fixed number.
-	local height = Vector3.yAxis * (root.Size.Y / 2 + model["Left Leg"].Size.Y)
-	local start = waypoints[1]
-	local fwd = flatUnit(waypoints[2] - start, -Vector3.zAxis)
+function Enemy.new(serverFolder: Folder): EnemyObject
+	local enemyInfo = EnemyData[serverFolder:GetAttribute("EnemyID")]
+	local speed = serverFolder:GetAttribute("Speed")
+	local model = enemyInfo.model.Model:Clone()
+	local rootPart = model.PrimaryPart
 
-	root.CFrame = CFrame.lookAt(start + height, start + height + fwd)
-	model.Name = part.Name
-	model.Parent = cliDir
-	playLoop(model.AnimationController.Animator, model.Animation, speed * ANIM_RATE)
+	-- The root's centre sits half a root plus one leg above the feet. It's read from the
+	-- model because the Tank is scaled up and would sink into the road with a fixed number.
+	local heightOffset = Vector3.yAxis * (rootPart.Size.Y / 2 + model["Left Leg"].Size.Y)
+	local startPosition = waypoints[1]
+	local facing = getFlatDirection(waypoints[2] - startPosition, -Vector3.zAxis)
 
-	return setmetatable({
-		part = part,
-		model = model,
-		root = root,
-		speed = speed,
-		pos = start,
-		vel = fwd * speed,
-		fwd = fwd,
-		tgtWp = 2,
-		side = (math.random() * 2 - 1) * SIDE_SPRD,
-		height = height,
-	}, Enemy) :: any
+	local spawnPosition = startPosition + heightOffset
+	rootPart.CFrame = CFrame.lookAt(spawnPosition, spawnPosition + facing)
+	model.Name = serverFolder.Name
+	model.Parent = clientFolder
+
+	local animator = model.AnimationController.Animator
+	playLoopedAnimation(animator, model.Animation, speed * WALK_ANIMATION_RATE)
+
+	local self = {
+		rootPart = rootPart,
+		_model = model,
+		_speed = speed,
+		_position = startPosition,
+		_velocity = facing * speed,
+		_facing = facing,
+		_nextWaypoint = 2,
+		_sideOffset = (math.random() * 2 - 1) * PATH_SIDE_SPREAD,
+		_heightOffset = heightOffset,
+	}
+	return setmetatable(self, Enemy)
 end
 
---[[ leftover distance carries past a corner, which
-is what keeps both sides in step without sending positions. stops at the last waypoint
-and waits there for the server to remove it.]]
-function Enemy:walk(dt: number): ()
-	local left = self.speed * dt
-	while left > 0 do
-		local wp = waypoints[self.tgtWp]
-		if not wp then
-			self.vel = Vector3.zero
+--[[
+	Same walking rule as the server's EnemyAI: distance left over after reaching a corner
+	carries on toward the next waypoint. Matching that rule is what keeps both sides in
+	step without sending positions. At the last waypoint the enemy stops and waits there
+	for the server to remove it.
+]]
+function Enemy:_walk(deltaTime: number): ()
+	local distanceLeft = self._speed * deltaTime
+
+	while distanceLeft > 0 do
+		local waypoint = waypoints[self._nextWaypoint]
+		if not waypoint then
+			self._velocity = Vector3.zero
 			return
 		end
-		local dir = wp - self.pos
-		local dist = dir.Magnitude
-		if dist > 0 then
-			self.vel = dir.Unit * self.speed
-			self.fwd = flatUnit(dir, self.fwd)
+
+		local toWaypoint = waypoint - self._position
+		local distance = toWaypoint.Magnitude
+		if distance > 0 then
+			self._velocity = toWaypoint.Unit * self._speed
+			self._facing = getFlatDirection(toWaypoint, self._facing)
 		end
-		if dist > left then
-			self.pos += dir.Unit * left
+
+		if distance > distanceLeft then
+			self._position += toWaypoint.Unit * distanceLeft
 			return
 		end
-		self.pos = wp
-		self.tgtWp += 1
-		left -= dist
+
+		self._position = waypoint
+		self._nextWaypoint += 1
+		distanceLeft -= distance
 	end
 end
 
--- returns CFrame instead of applying it so the frame loop can move every enemy in
--- one bulkmoveTo call, which is far cheaper than setting CFrame on each root.
-function Enemy:step(dt: number): CFrame
-	self:walk(dt)
-	-- The sidestep follows the model's CURRENT facing, not the path's. Using the path's
+--[[
+	Returns this frame's CFrame instead of applying it, so the frame loop can move every
+	enemy in one BulkMoveTo call, which is far cheaper than setting CFrame on each root.
+]]
+function Enemy:update(deltaTime: number): CFrame
+	self:_walk(deltaTime)
+
+	-- The side offset follows the model's CURRENT facing, not the path's. Using the path's
 	-- would snap the enemy sideways at a corner while it is still mid-turn.
-	local look = self.root.CFrame.LookVector
-	local perp = Vector3.new(-look.Z, 0, look.X)
-	local newPos = self.pos + self.height + perp * self.side
-	local rotated = CFrame.new(newPos) * self.root.CFrame.Rotation
-	return rotated:Lerp(CFrame.lookAt(newPos, newPos + self.fwd), turnAlpha(dt))
+	local currentCFrame = self.rootPart.CFrame
+	local lookVector = currentCFrame.LookVector
+	local sideways = Vector3.new(-lookVector.Z, 0, lookVector.X)
+	local newPosition = self._position + self._heightOffset + sideways * self._sideOffset
+
+	local keptRotation = CFrame.new(newPosition) * currentCFrame.Rotation
+	local targetCFrame = CFrame.lookAt(newPosition, newPosition + self._facing)
+	return keptRotation:Lerp(targetCFrame, getTurnAlpha(deltaTime))
 end
 
--- Where a bullet leaving now should aim, so it meets the enemy instead of landing behind.
-function Enemy:aimPos(flight: number): Vector3
-	return self.root.Position + self.vel * flight
+-- Where a bullet fired now should aim, so it meets the enemy instead of landing behind it.
+function Enemy:predictPosition(flightTime: number): Vector3
+	return self.rootPart.Position + self._velocity * flightTime
 end
 
 function Enemy:destroy(): ()
-	self.model:Destroy() -- the animation track goes with it
+	-- The walk animation track belongs to the model, so it is cleaned up with it.
+	self._model:Destroy()
 end
 
-local function addEnemy(part: Instance): ()
-	enemies[part] = Enemy.new(part :: Folder)
+local function onEnemyAdded(serverFolder: Instance): ()
+	enemiesByFolder[serverFolder] = Enemy.new(serverFolder :: Folder)
 end
 
-local function delEnemy(part: Instance): ()
-	local enm = enemies[part]
-	if enm then
-		enm:destroy()
-		enemies[part] = nil
+local function onEnemyRemoved(serverFolder: Instance): ()
+	local enemy = enemiesByFolder[serverFolder]
+	if not enemy then
+		return
 	end
+	enemy:destroy()
+	enemiesByFolder[serverFolder] = nil
 end
 
----------------------------------------[[BULLETS]]---------------------------------------
--- Towers fire constantly, so bullets are recycled instead of cloned and destroyed.
-local function takeBlt(): BasePart
-	local blt = table.remove(bltPool)
-	if not blt then
-		blt = bltTmpl:Clone()
-		blt.Beam.Enabled = false -- hidden until both ends are on the barrel
-		blt.Parent = vfxDir
+-- Towers fire constantly, so bullets are recycled instead of being cloned and destroyed.
+local function takeBullet(): BasePart
+	local bullet = table.remove(bulletPool)
+	if bullet then
+		return bullet
 	end
-	return blt
+
+	bullet = bulletTemplate:Clone()
+	-- Hidden until both ends have been moved onto the barrel.
+	bullet.Beam.Enabled = false
+	bullet.Parent = effectsFolder
+	return bullet
 end
 
-local function giveBlt(blt: BasePart): ()
-	blt.Beam.Enabled = false
-	table.insert(bltPool, blt)
+local function returnBullet(bullet: BasePart): ()
+	bullet.Beam.Enabled = false
+	table.insert(bulletPool, bullet)
 end
 
---[[ The Beam stretches between two attachments, so the bullet is both ends travelling:
-the head leaves straight away and the tail chases it after a short delay. That delay
-is what gives the tracer its length, at any bullet speed.]]
-local function shootBlt(from: Vector3, to: Vector3, speed: number): ()
-	local flight = (to - from).Magnitude / speed
-	local blt = takeBlt()
-	local head, tail = blt.Point2, blt.Point1
-	blt.Position = from
-	head.WorldPosition = from
-	tail.WorldPosition = from
-	blt.Beam.Enabled = true
+--[[
+	The Beam stretches between two attachments, so a bullet is both ends travelling: the
+	head leaves straight away and the tail chases it after a short delay. That delay is
+	what gives the tracer its length, at any bullet speed.
+]]
+local function fireBullet(origin: Vector3, target: Vector3, speed: number): ()
+	local flightTime = (target - origin).Magnitude / speed
+	local bullet = takeBullet()
+	local head = bullet.Point2
+	local tail = bullet.Point1
 
-	local style, way = Enum.EasingStyle.Linear, Enum.EasingDirection.Out
-	local gap = math.min(BLT_TAIL / speed, flight)
-	local tailTwn = TweenSvc:Create(tail, TweenInfo.new(flight, style, way, 0, false, gap), { WorldPosition = to })
+	bullet.Position = origin
+	head.WorldPosition = origin
+	tail.WorldPosition = origin
+	bullet.Beam.Enabled = true
+
+	local tailDelay = math.min(BULLET_TRAIL_LENGTH / speed, flightTime)
+	local headInfo = TweenInfo.new(flightTime, Enum.EasingStyle.Linear)
+	local tailInfo = TweenInfo.new(
+		flightTime,
+		Enum.EasingStyle.Linear,
+		Enum.EasingDirection.Out,
+		0,
+		false,
+		tailDelay
+	)
+	local headTween = TweenService:Create(head, headInfo, { WorldPosition = target })
+	local tailTween = TweenService:Create(tail, tailInfo, { WorldPosition = target })
+
 	-- The tail lands last, so its Completed is the moment the bullet is free to reuse.
-	tailTwn.Completed:Once(function()
-		giveBlt(blt)
+	tailTween.Completed:Once(function()
+		returnBullet(bullet)
 	end)
-	TweenSvc:Create(head, TweenInfo.new(flight, style, way), { WorldPosition = to }):Play()
-	tailTwn:Play()
+	headTween:Play()
+	tailTween:Play()
 end
 
----------------------------------------[[TOWERS]]---------------------------------------
-local Tower = {}
-Tower.__index = Tower
-
-function Tower.new(dir: Instance): TowerObj
-	local model = dir:WaitForChild("Model")
-	local gunDir = dir:FindFirstChildOfClass("Folder")
+--[[
+	Each tower's folder holds a folder named after its gun. It's found by class rather
+	than by name, so every tower can share this constructor.
+]]
+function Tower.new(towerFolder: Instance): TowerObject
+	local model = towerFolder:WaitForChild("Model")
+	local gunFolder = towerFolder:FindFirstChildOfClass("Folder")
 	local animator = model.AnimationController.Animator
-	gunDir.HandleMiddle.Parent = model
-	-- anim player
-	playLoop(animator, gunDir.Idle).Priority = Enum.AnimationPriority.Idle
-	return setmetatable({
-		root = model.PrimaryPart,
-		stats = TowerData[dir.Name],
-		tgtVal = model:WaitForChild("Target"),
-		barrel = gunDir.Barrel.Value,
-		shoot = animator:LoadAnimation(gunDir.Shoot),
-		cool = 0,
-	}, Tower) :: any
+
+	-- The rig's joints already reach the gun, but an Animator only drives joints inside
+	-- its own model. Without this the gun would stay frozen while the arms moved.
+	gunFolder.HandleMiddle.Parent = model
+
+	-- The Sniper's idle was exported at Action priority, the same as its shot, and two
+	-- tracks at one priority blend into a half-strength shot. The idle must always lose.
+	local idleTrack = playLoopedAnimation(animator, gunFolder.Idle)
+	idleTrack.Priority = Enum.AnimationPriority.Idle
+
+	local self = {
+		_rootPart = model.PrimaryPart,
+		_stats = TowerData[towerFolder.Name],
+		_targetValue = model:WaitForChild("Target"),
+		_barrel = gunFolder.Barrel.Value,
+		_shootTrack = animator:LoadAnimation(gunFolder.Shoot),
+		_cooldown = 0,
+	}
+	return setmetatable(self, Tower)
 end
 
--- stretches the shot over the attack interval so a fast and a slow gun can share the
--- rule. length is 0 until the asset has loaded, and dividing by it would break the speed.
-function Tower:playShot(): ()
-	local track = self.shoot
+--[[
+	Stretches the shot over the attack interval, so a fast and a slow gun can share one
+	rule. Length is 0 until the asset has loaded, and dividing by it would break the speed.
+]]
+function Tower:_playShootAnimation(): ()
+	local track = self._shootTrack
 	track:Stop()
 	track:Play(0)
 	if track.Length > 0 then
-		track:AdjustSpeed(track.Length / self.stats.atkSpeed)
+		track:AdjustSpeed(track.Length / self._stats.attackInterval)
 	end
 end
 
-function Tower:fire(enm: EnemyObj): ()
-	local stats = self.stats
-	local from = self.barrel.Position
-	local flight = (enm.root.Position - from).Magnitude / stats.bulletSpd
-	self.cool = stats.atkSpeed
-	self:playShot()
-	shootBlt(from, enm:aimPos(flight), stats.bulletSpd)
+function Tower:_fire(enemy: EnemyObject): ()
+	local stats = self._stats
+	local origin = self._barrel.Position
+	local flightTime = (enemy.rootPart.Position - origin).Magnitude / stats.bulletSpeed
+
+	self._cooldown = stats.attackInterval
+	self:_playShootAnimation()
+	fireBullet(origin, enemy:predictPosition(flightTime), stats.bulletSpeed)
 end
 
--- the root is anchored and everything else hangs off it by joints, so turning this one
--- part turns the whole tower, gun included.
-function Tower:face(pos: Vector3, dt: number): ()
-	local base = self.root.Position
-	local goal = CFrame.lookAt(base, base + flatUnit(pos - base, self.root.CFrame.LookVector))
-	self.root.CFrame = self.root.CFrame:Lerp(goal, turnAlpha(dt))
+--[[
+	The root is anchored and everything else hangs off it by joints, so turning this one
+	part turns the whole tower, gun included.
+]]
+function Tower:_turnTowards(targetPosition: Vector3, deltaTime: number): ()
+	local currentCFrame = self._rootPart.CFrame
+	local basePosition = currentCFrame.Position
+	local direction = getFlatDirection(targetPosition - basePosition, currentCFrame.LookVector)
+	local goalCFrame = CFrame.lookAt(basePosition, basePosition + direction)
+	self._rootPart.CFrame = currentCFrame:Lerp(goalCFrame, getTurnAlpha(deltaTime))
 end
 
--- The target can be a destroyed enemy for a moment (the server retargets once per shot).
--- It simply isn't in the table any more, and that's the only check needed.
-function Tower:step(dt: number): ()
-	self.cool -= dt
-	local enm = enemies[self.tgtVal.Value]
-	if not enm then
+--[[
+	The target can be a destroyed enemy for a moment, since the server only retargets once
+	per shot. That enemy is simply missing from the lookup, which is the only check needed.
+]]
+function Tower:update(deltaTime: number): ()
+	self._cooldown -= deltaTime
+
+	local enemy = enemiesByFolder[self._targetValue.Value]
+	if not enemy then
 		return
 	end
-	self:face(enm.root.Position, dt)
-	if self.cool <= 0 then
-		self:fire(enm)
+
+	self:_turnTowards(enemy.rootPart.Position, deltaTime)
+	if self._cooldown <= 0 then
+		self:_fire(enemy)
 	end
 end
 
----------------------------------------[[STARTUP]]---------------------------------------
-buildPath()
+local function onRenderStepped(deltaTime: number): ()
+	table.clear(movedParts)
+	table.clear(movedCFrames)
+	for _, enemy in pairs(enemiesByFolder) do
+		table.insert(movedParts, enemy.rootPart)
+		table.insert(movedCFrames, enemy:update(deltaTime))
+	end
+	Workspace:BulkMoveTo(movedParts, movedCFrames, Enum.BulkMoveMode.FireCFrameChanged)
 
-for _, dir in ipairs(twrDir:GetChildren()) do
-	table.insert(towers, Tower.new(dir))
+	-- Towers update after enemies, so they aim at this frame's positions, not last frame's.
+	for _, tower in ipairs(towers) do
+		tower:update(deltaTime)
+	end
 end
 
--- whatever spawned while this client was loading wouldn't fire ChildAdded.
-for _, part in ipairs(enmDir:GetChildren()) do
-	addEnemy(part)
-end
-enmDir.ChildAdded:Connect(addEnemy)
-enmDir.ChildRemoved:Connect(delEnemy)
+buildWaypoints()
 
-RunService.RenderStepped:Connect(function(dt: number)
-	table.clear(bulkPart)
-	table.clear(bulkCf)
-	for _, enm in enemies do
-		table.insert(bulkPart, enm.root)
-		table.insert(bulkCf, enm:step(dt))
-	end
-	workspace:BulkMoveTo(bulkPart, bulkCf, Enum.BulkMoveMode.FireCFrameChanged)
-	-- towers go after enemies so they aim at this frame's positions, not last frame's.
-	for _, twr in ipairs(towers) do
-		twr:step(dt)
-	end
-end)
+for _, towerFolder in ipairs(towersFolder:GetChildren()) do
+	table.insert(towers, Tower.new(towerFolder))
+end
+
+-- Anything that spawned while this client was loading never fired ChildAdded.
+for _, serverFolder in ipairs(enemiesFolder:GetChildren()) do
+	onEnemyAdded(serverFolder)
+end
+enemiesFolder.ChildAdded:Connect(onEnemyAdded)
+enemiesFolder.ChildRemoved:Connect(onEnemyRemoved)
+
+RunService.RenderStepped:Connect(onRenderStepped)
