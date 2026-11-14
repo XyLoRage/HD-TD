@@ -13,7 +13,8 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
--- This script runs from ReplicatedFirst, which starts before the map has replicated.
+-- ReplicatedFirst starts before the map has replicated, so wait for it here,
+-- or direct indexing into the map below could error.
 if not game:IsLoaded() then
 	game.Loaded:Wait()
 end
@@ -26,7 +27,7 @@ local TowerData = require(dataFolder:WaitForChild("TowerData"))
 local TURN_SPEED = 8
 -- Furthest an enemy walks from the path's centre, so a wave doesn't move in single file.
 local PATH_SIDE_SPREAD = 0.7
--- Walk cycles per stud of speed, which keeps the feet in time with the ground.
+-- Walk animation speed per stud/s of move speed, so faster enemies' feet don't slide.
 local WALK_ANIMATION_RATE = 0.15
 -- Length of a bullet tracer in studs: how far its head leads its tail.
 local BULLET_TRAIL_LENGTH = 6
@@ -39,6 +40,7 @@ local MIN_DIRECTION_LENGTH = 0.01
 local enemiesFolder = Workspace:WaitForChild("Enemies")
 local towersFolder = Workspace:WaitForChild("Towers")
 local pathFolder = Workspace:WaitForChild("Path")
+local roadFolder = Workspace:WaitForChild("Road")
 local clientFolder = Workspace:WaitForChild("Client")
 local effectsFolder = Workspace:WaitForChild("VFX")
 local bulletTemplate = ReplicatedStorage:WaitForChild("VFX")
@@ -62,6 +64,12 @@ type EnemyFields = {
 	_sideOffset: number,
 	_heightOffset: Vector3,
 }
+--[[
+	Luau can't name "a table with these fields AND Enemy's methods" directly, so the type is
+	inferred from what setmetatable would return. Casting {} to EnemyFields gives the fields,
+	the metatable gives :_walk, :update etc., so self is fully typed inside every method.
+	typeof() here only runs in the type checker; nothing is created at runtime.
+]]
 type EnemyObject = typeof(setmetatable({} :: EnemyFields, Enemy))
 
 type TowerStats = {
@@ -98,19 +106,20 @@ local movedCFrames: { CFrame } = {}
 ]]
 local function buildWaypoints(): ()
 	local raycastParams = RaycastParams.new()
-	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	-- Exclusively scans the road.
+	raycastParams.FilterType = Enum.RaycastFilterType.Include
 	raycastParams.FilterDescendantsInstances = {
-		pathFolder,
-		towersFolder,
-		clientFolder,
-		effectsFolder,
+		roadFolder,
 	}
 
 	for _, waypointPart in ipairs(pathFolder:GetChildren()) do
+		-- Start above the waypoint in case it sits at or below the road surface;
+		-- a ray that starts inside the road won't hit it.
 		local rayOrigin = waypointPart.Position + Vector3.yAxis * GROUND_RAY_HEIGHT
 		local rayDirection = Vector3.yAxis * -GROUND_RAY_LENGTH
 		local result = Workspace:Raycast(rayOrigin, rayDirection, raycastParams)
 		local index = tonumber(waypointPart.Name)
+		-- Use the road hit if there was one, else fall back to the waypoint's own position.
 		waypoints[index] = if result then result.Position else waypointPart.Position
 	end
 end
@@ -121,6 +130,8 @@ end
 ]]
 local function getFlatDirection(direction: Vector3, fallback: Vector3): Vector3
 	local flatDirection = Vector3.new(direction.X, 0, direction.Z)
+	-- A (near) zero vector can't be normalized since .Unit divides by the
+	-- magnitude, so use the fallback.
 	if flatDirection.Magnitude < MIN_DIRECTION_LENGTH then
 		return fallback
 	end
@@ -129,6 +140,7 @@ end
 
 -- Scaling by the frame time keeps turning speed equal at any framerate; a fixed alpha wouldn't.
 local function getTurnAlpha(deltaTime: number): number
+	-- Clamped at 1 so the lerp never overshoots the target on a long frame.
 	return math.clamp(TURN_SPEED * deltaTime, 0, 1)
 end
 
@@ -150,10 +162,12 @@ function Enemy.new(serverFolder: Folder): EnemyObject
 	local model = enemyInfo.model.Model:Clone()
 	local rootPart = model.PrimaryPart
 
-	-- The root's centre sits half a root plus one leg above the feet. It's read from the
-	-- model because the Tank is scaled up and would sink into the road with a fixed number.
+	-- The script positions the root part, but waypoints sit on the ground,
+	-- so the root has to be lifted by half its own height plus one leg.
 	local heightOffset = Vector3.yAxis * (rootPart.Size.Y / 2 + model["Left Leg"].Size.Y)
 	local startPosition = waypoints[1]
+	-- Face the second waypoint. -Z is the fallback if waypoints 1 and 2 are stacked,
+	-- since it's a CFrame's default LookVector.
 	local facing = getFlatDirection(waypoints[2] - startPosition, -Vector3.zAxis)
 
 	local spawnPosition = startPosition + heightOffset
@@ -172,6 +186,7 @@ function Enemy.new(serverFolder: Folder): EnemyObject
 		_velocity = facing * speed,
 		_facing = facing,
 		_nextWaypoint = 2,
+		-- Random per enemy, rolled once here so it stays steady instead of jittering.
 		_sideOffset = (math.random() * 2 - 1) * PATH_SIDE_SPREAD,
 		_heightOffset = heightOffset,
 	}
@@ -185,10 +200,14 @@ end
 	for the server to remove it.
 ]]
 function Enemy:_walk(deltaTime: number): ()
+	-- Total studs this enemy is allowed to cover this frame.
 	local distanceLeft = self._speed * deltaTime
 
+	-- A loop, not an if: on a laggy frame one step can pass several corners, and each
+	-- corner reached spends part of the budget before moving on to the next waypoint.
 	while distanceLeft > 0 do
 		local waypoint = waypoints[self._nextWaypoint]
+		-- Past the last waypoint: stand still (zero velocity so towers stop leading the shot).
 		if not waypoint then
 			self._velocity = Vector3.zero
 			return
@@ -196,16 +215,20 @@ function Enemy:_walk(deltaTime: number): ()
 
 		local toWaypoint = waypoint - self._position
 		local distance = toWaypoint.Magnitude
+		-- Guarded because .Unit of a zero vector is NaN (standing exactly on the waypoint).
 		if distance > 0 then
 			self._velocity = toWaypoint.Unit * self._speed
 			self._facing = getFlatDirection(toWaypoint, self._facing)
 		end
 
+		-- Waypoint is further than this frame's budget: step part of the way and stop.
 		if distance > distanceLeft then
 			self._position += toWaypoint.Unit * distanceLeft
 			return
 		end
 
+		-- Waypoint is within reach: snap onto it, aim at the next one, and carry the
+		-- leftover distance into the next loop so no movement is lost at the corner.
 		self._position = waypoint
 		self._nextWaypoint += 1
 		distanceLeft -= distance
@@ -223,11 +246,17 @@ function Enemy:update(deltaTime: number): CFrame
 	-- would snap the enemy sideways at a corner while it is still mid-turn.
 	local currentCFrame = self.rootPart.CFrame
 	local lookVector = currentCFrame.LookVector
+	-- Finds the left/right direction of the model, swapping X and Z and negating one turns
+	-- the look vector 90° around the Y axis.
 	local sideways = Vector3.new(-lookVector.Z, 0, lookVector.X)
+	-- Push the enemy off the path's centre line by its own side offset.
+	-- _position is on the road, so heightOffset lifts the root up to standing height.
 	local newPosition = self._position + self._heightOffset + sideways * self._sideOffset
 
 	local keptRotation = CFrame.new(newPosition) * currentCFrame.Rotation
 	local targetCFrame = CFrame.lookAt(newPosition, newPosition + self._facing)
+	-- Both CFrames share the same position, so the lerp only blends
+	-- rotation and the model turns gradually.
 	return keptRotation:Lerp(targetCFrame, getTurnAlpha(deltaTime))
 end
 
@@ -288,7 +317,8 @@ local function fireBullet(origin: Vector3, target: Vector3, speed: number): ()
 	head.WorldPosition = origin
 	tail.WorldPosition = origin
 	bullet.Beam.Enabled = true
-
+	-- Delay = trail length / speed. Capped at flightTime so on short shots the tail
+	-- doesn't sit at the barrel after the head has already landed.
 	local tailDelay = math.min(BULLET_TRAIL_LENGTH / speed, flightTime)
 	local headInfo = TweenInfo.new(flightTime, Enum.EasingStyle.Linear)
 	local tailInfo = TweenInfo.new(
@@ -355,10 +385,12 @@ end
 function Tower:_fire(enemy: EnemyObject): ()
 	local stats = self._stats
 	local origin = self._barrel.Position
+	-- Dividing by the speed gives the time it takes the bullet to reach the target.
 	local flightTime = (enemy.rootPart.Position - origin).Magnitude / stats.bulletSpeed
 
 	self._cooldown = stats.attackInterval
 	self:_playShootAnimation()
+	-- Aims at the predicted position so the bullet lands on the enemy's model when the tween ends
 	fireBullet(origin, enemy:predictPosition(flightTime), stats.bulletSpeed)
 end
 
@@ -393,12 +425,19 @@ function Tower:update(deltaTime: number): ()
 end
 
 local function onRenderStepped(deltaTime: number): ()
+	-- table.clear keeps the arrays' allocated size, so once a big wave has filled them
+	-- this loop allocates nothing. New {} each frame would be two tables of GC per frame.
 	table.clear(movedParts)
 	table.clear(movedCFrames)
+	-- BulkMoveTo pairs movedParts[i] with movedCFrames[i], so both are pushed in the
+	-- same iteration. If one ever skipped, every later enemy would get the wrong CFrame.
 	for _, enemy in pairs(enemiesByFolder) do
 		table.insert(movedParts, enemy.rootPart)
 		table.insert(movedCFrames, enemy:update(deltaTime))
 	end
+	-- One engine call for the whole wave instead of a CFrame write per root, where each
+	-- write crosses into the engine and fires its own property change events.
+	-- FireCFrameChanged only fires CFrame's change signal, skipping Position/Orientation.
 	Workspace:BulkMoveTo(movedParts, movedCFrames, Enum.BulkMoveMode.FireCFrameChanged)
 
 	-- Towers update after enemies, so they aim at this frame's positions, not last frame's.
@@ -420,4 +459,10 @@ end
 enemiesFolder.ChildAdded:Connect(onEnemyAdded)
 enemiesFolder.ChildRemoved:Connect(onEnemyRemoved)
 
+--[[
+	RenderStepped, not Heartbeat/Stepped: it runs right before the frame is drawn, so moves
+	show up this frame. Heartbeat runs after, so they'd appear a frame late. Nothing here
+	needs Stepped's pre-physics timing; it's all client-only visuals.
+	It blocks the frame until it returns, so keep the work light.
+]]
 RunService.RenderStepped:Connect(onRenderStepped)
